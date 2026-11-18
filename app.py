@@ -1,8 +1,7 @@
-"""Dash web app for exploring simpleSAM output files.
+"""Dash web app for exploring ASTRAEUS treefiles (tree_*.dat).
 
-Run from the repository root:
-
-    python viewer/app.py --dir outputs --port 8050
+    python build_index.py tree_0.dat        # once per treefile
+    python app.py --dir . --port 8050
 """
 
 from __future__ import annotations
@@ -18,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from data import get_output, list_outputs, load_cosmology, set_cosmology  # noqa: E402
 from figures import evolution_figure, relation_figure, snapshot_figure, tree_figure  # noqa: E402
 
+MAX_TREE_OPTIONS = 500  # trees listed in the dropdown (the largest ones); any other via "Go to treeID"
 MAX_TREE_NODES = 20_000  # default mass cut keeps at most this many galaxies on screen
 TIME_LABELS = {"snapnumber": "Snapshot", "scalefactor": "Scale factor", "redshift": "Redshift",
                "cosmic_time": "Cosmic time [Gyr]", "lookback_time": "Lookback time [Gyr]"}
@@ -39,27 +39,39 @@ def custom_item(point: dict, i: int = 0):
 
 
 def step_index(out, value) -> int:
-    """Index into ``out.steps`` for a slider value (a snapshot number, or an index without snapnumber)."""
+    """Index into ``out.steps`` for a slider value (a snapshot number)."""
 
-    n = len(out.steps)
-    if "snapnumber" not in out.df:
-        return int(min(max(value, 0), n - 1))
     return int(max(np.searchsorted(out.steps, value, side="right") - 1, 0))
 
 
+def tree_option(out, tree_id: int) -> dict:
+    return {"label": f"tree {tree_id} — {out.ngal[tree_id]} galaxies, max {out.mass_col} {out.tree_mass[tree_id]:.2e}",
+            "value": int(tree_id)}
+
+
+def with_tree(out, options, tree_id: int):
+    """Dropdown options including ``tree_id`` (only the largest trees are listed by default)."""
+
+    if any(o["value"] == tree_id for o in options or []):
+        return no_update
+    return (options or []) + [tree_option(out, tree_id)]
+
+
 def build_app(directory: Path) -> Dash:
-    app = Dash(__name__, suppress_callback_exceptions=True, title="simpleSAM viewer")
+    app = Dash(__name__, suppress_callback_exceptions=True, title="ASTRAEUS viewer")
 
     def labelled(text, component):
         return html.Div([html.Label(text, className="lbl"), component], className="field")
 
     sidebar = html.Div([
-        html.H3("simpleSAM viewer"),
+        html.H3("ASTRAEUS viewer"),
         labelled("Output file", html.Div([
             dcc.Dropdown(id="file", clearable=False),
             html.Button("Refresh file list", id="refresh", n_clicks=0, className="small"),
         ])),
-        labelled("Merger tree", dcc.Dropdown(id="tree", clearable=False)),
+        labelled(f"Merger tree ({MAX_TREE_OPTIONS} largest listed)", dcc.Dropdown(id="tree", clearable=False)),
+        labelled("Go to treeID", dcc.Input(id="jump-tree", type="number", debounce=True, step=1, min=0,
+                                           style={"width": "100%"})),
         html.Hr(),
         html.H4("Selected galaxy"),
         html.Div(id="selection-label"),
@@ -204,16 +216,14 @@ def build_app(directory: Path) -> Dash:
         Input("file", "value"))
     def on_file(path):
         if not path:
-            msg = f"No *.json files found in {directory}"
+            msg = f"No tree_*.dat files found in {directory}"
             return ([], None, [], None, [], None, [], [], None, [], None, [], None, [], None, [], msg)
         try:
             out = get_output(path)
         except Exception as exc:  # show the problem in the UI instead of a blank page
             return ([], None, [], None, [], None, [], [], None, [], None, [], None, [], None, [], f"Cannot read {path}: {exc}")
 
-        summary = out.tree_summary().sort_values("n", ascending=False)
-        tree_opts = [{"label": f"tree {r.treeID} — {r.n} galaxies, max {out.mass_col} {r.mass:.2e}",
-                      "value": int(r.treeID)} for r in summary.itertuples()]
+        tree_opts = [tree_option(out, int(t)) for t in out.tree_summary().nlargest(MAX_TREE_OPTIONS, "n")["treeID"]]
         time_opts = [{"label": TIME_LABELS[c], "value": c} for c in out.time_cols]
         params = out.params
         first = out.time_cols[0]
@@ -227,26 +237,19 @@ def build_app(directory: Path) -> Dash:
 
     # ---------------------------------------------------------------- tree selection
     def slider_props(path):
-        """(min, max, value, marks) of a time slider over the file's snapshot numbers.
-
-        Without a snapnumber column the slider runs over step indices, labelled with the scale factor.
-        """
+        """(min, max, value, marks) of a time slider over the file's snapshot numbers."""
 
         if not path:
             return 0, 1, 1, {}
-        out = get_output(path)
-        steps = out.steps
-        if "snapnumber" in out.df:
-            lo, hi = int(steps[0]), int(steps[-1])
-            every = max(1, int(np.ceil((hi - lo) / 10)))
-            marks = {v: str(v) for v in range(lo, hi + 1, every)}
-            marks[hi] = str(hi)
-            return lo, hi, hi, marks
-        n = len(steps)
-        every = max(1, n // 8)
-        marks = {i: f"{steps[i]:.3g}" for i in range(0, n, every)}
-        marks[n - 1] = f"{steps[-1]:.3g}"
-        return 0, n - 1, n - 1, marks
+        try:
+            steps = get_output(path).steps
+        except Exception:  # on_file reports the problem
+            return 0, 1, 1, {}
+        lo, hi = int(steps[0]), int(steps[-1])
+        every = max(1, int(np.ceil((hi - lo) / 10)))
+        marks = {v: str(v) for v in range(lo, hi + 1, every)}
+        marks[hi] = str(hi)
+        return lo, hi, hi, marks
 
     @app.callback(
         Output("step", "min"), Output("step", "max"), Output("step", "value"), Output("step", "marks"),
@@ -266,7 +269,7 @@ def build_app(directory: Path) -> Dash:
         positive = tree.mass[tree.mass > 0]
         lo = float(np.log10(positive.min())) if len(positive) else 0.0
         hi = float(np.log10(positive.max())) if len(positive) else 1.0
-        lo, hi = np.floor(lo * 10) / 10, np.ceil(hi * 10) / 10
+        lo, hi = float(np.floor(lo * 10) / 10), float(np.ceil(hi * 10) / 10)  # plain floats: they become JSON keys
         if len(positive) > MAX_TREE_NODES:
             default = float(np.log10(np.sort(positive)[-MAX_TREE_NODES]))
         else:
@@ -347,18 +350,8 @@ def build_app(directory: Path) -> Dash:
             out, tree, orient=orient, time_col=time_col, mode=tmode, step=idx,
             color_by=color_by, log_color=bool(log_color), size_by=size_by,
             mass_cut=10 ** cut if cut else None, selected=selected_row(sel, tree_id, tree))
-        key = "snapnumber" if "snapnumber" in out.df else "scalefactor"
         n_now = int((tree.df["_step"] <= idx).sum())
-        extra = ""
-        when = tree.df[tree.df["_step"] == idx]
-        if len(when) == 0:
-            when = out.df[out.df["_step"] == idx]
-        if len(when) and "redshift" in when:
-            extra = f" (z = {when['redshift'].iloc[0]:.3g}"
-            if "cosmic_time" in when:
-                extra += f", t = {when['cosmic_time'].iloc[0]:.3g} Gyr"
-            extra += ")"
-        label = f"{key} {out.steps[idx]:.4g}{extra} — {n_now} of {len(tree.df)} galaxies exist by now"
+        label = f"{out.step_label(idx)} — {n_now} of {len(tree.df)} galaxies exist by now"
         return fig, label
 
     @app.callback(Output("tick", "disabled"), Output("tick", "interval"), Output("play", "children"),
@@ -375,8 +368,6 @@ def build_app(directory: Path) -> Dash:
         if not path or value is None:
             return no_update
         out = get_output(path)
-        if "snapnumber" not in out.df:
-            return vmin if value >= len(out.steps) - 1 else value + 1
         later = out.steps[out.steps > value]
         return int(later[0]) if len(later) else vmin
 
@@ -393,9 +384,12 @@ def build_app(directory: Path) -> Dash:
         Output("snap-step", "min"), Output("snap-step", "max"), Output("snap-step", "value"),
         Output("snap-step", "marks"), Input("file", "value"))
     def snap_controls(path):
-        if not path:
+        try:
+            out = get_output(path) if path else None
+        except Exception:  # on_file reports the problem
+            out = None
+        if out is None:
             return [], None, [], None, [], None, 0, 1, 1, {}
-        out = get_output(path)
         params = out.params
         x = out.mass_col if out.mass_col in params else params[0]
         y = "Mstar" if "Mstar" in params else params[-1]
@@ -414,15 +408,7 @@ def build_app(directory: Path) -> Dash:
         flags = flags or []
         fig, n = snapshot_figure(out, out.tree(tree_id), idx, x, y, color, scope, "logx" in flags,
                                  "logy" in flags, "fix" in flags, "median" in flags)
-        key = "snapnumber" if "snapnumber" in out.df else "scalefactor"
-        rows = out.df[out.df["_step"] == idx]
-        label = f"{key} {out.steps[idx]:.4g}"
-        if len(rows) and "redshift" in rows:
-            label += f" (z = {rows['redshift'].iloc[0]:.3g}"
-            if "cosmic_time" in rows:
-                label += f", t = {rows['cosmic_time'].iloc[0]:.3g} Gyr"
-            label += ")"
-        return fig, f"{label} — {n:,} galaxies. Click a point to select that galaxy."
+        return fig, f"{out.step_label(idx)} — {n:,} galaxies. Click a point to select that galaxy."
 
     @app.callback(Output("snap-tick", "disabled"), Output("snap-tick", "interval"), Output("snap-play", "children"),
                   Input("snap-play", "n_clicks"), Input("snap-speed", "value"), State("snap-tick", "disabled"),
@@ -438,18 +424,30 @@ def build_app(directory: Path) -> Dash:
     def snap_advance(_, value, vmin, path):
         return next_step(path, value, vmin)
 
-    @app.callback(Output("tree", "value", allow_duplicate=True), Output("pending", "data"),
-                  Input("snap-graph", "clickData"), State("tree", "value"), prevent_initial_call=True)
-    def snap_click_other_tree(click, tree_id):
-        """A point from another tree: switch to that tree, remembering which galaxy to select."""
+    @app.callback(Output("tree", "options", allow_duplicate=True), Output("tree", "value", allow_duplicate=True),
+                  Output("pending", "data"),
+                  Input("snap-graph", "clickData"), Input("rel-graph", "clickData"), Input("jump-tree", "value"),
+                  State("tree", "value"), State("tree", "options"), State("file", "value"),
+                  prevent_initial_call=True)
+    def other_tree(snap_click, rel_click, jump, tree_id, options, path):
+        """Switch tree: "Go to treeID", or a clicked scatter point that belongs to another tree
+        (remembering which galaxy to select once the tree is shown)."""
 
-        if not click:
-            return no_update, no_update
-        point = click["points"][0]
-        tid, local = custom_item(point, 0), custom_item(point, 1)
-        if tid is None or local is None or int(tid) == int(tree_id):
-            return no_update, no_update
-        return int(tid), {"tree": int(tid), "local": int(local)}
+        if not path:
+            return no_update, no_update, no_update
+        out = get_output(path)
+        if ctx.triggered_id == "jump-tree":
+            tid, pending = jump, no_update
+        else:
+            click = snap_click if ctx.triggered_id == "snap-graph" else rel_click
+            if not click:
+                return no_update, no_update, no_update
+            point = click["points"][0]
+            tid, local = custom_item(point, 0), custom_item(point, 1)
+            pending = None if tid is None or local is None else {"tree": int(tid), "local": int(local)}
+        if tid is None or int(tid) == tree_id or not out.has_tree(int(tid)):
+            return no_update, no_update, no_update
+        return with_tree(out, options, int(tid)), int(tid), pending
 
     # ---------------------------------------------------------------- galaxy panel
     @app.callback(Output("galaxy-panel", "children"),
@@ -535,9 +533,10 @@ body { margin: 0; font-family: system-ui, sans-serif; }
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--dir", type=Path, default=Path("outputs"), help="directory with *.json outputs")
-    parser.add_argument("--config", type=Path, default=Path("config/fiducial.toml"),
-                        help="simulation parameter file; its [cosmology] table converts scale factor to cosmic time")
+    parser.add_argument("--dir", type=Path, default=Path("."), help="directory with tree_*.dat files")
+    parser.add_argument("--config", type=Path, default=None,
+                        help="TOML file whose [cosmology] table (Omega_m, Omega_L, h) converts scale factor "
+                             "to cosmic time; VSMDPL values are used without it")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8050)
     parser.add_argument("--debug", action="store_true")

@@ -1,41 +1,34 @@
-"""Loading of simulation output JSON files and merger-tree bookkeeping.
+"""Reading of ASTRAEUS treefiles (``tree_*.dat``) and merger-tree bookkeeping.
 
-The viewer never hard-codes galaxy properties: every numeric field found in the
-file becomes a plottable parameter, and list-valued fields (``pos``, ``vel``, ...)
-are split into ``pos_x, pos_y, pos_z`` (or ``name_0, name_1, ...``).
+The treefile is memory-mapped READ-ONLY and never loaded as a whole: a tree is read
+when it is selected, whole-file plots use a random sample of galaxies. The sidecar
+index written by ``build_index.py`` supplies everything that would need a full scan.
 """
 
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-try:  # optional, much faster for big files
-    import orjson
-except ImportError:  # pragma: no cover
-    orjson = None
+from astraeus_io import memmap_treefile
+from build_index import INDEX_VERSION, index_path
 
 # Columns describing the tree structure; they are not offered as plot parameters.
-STRUCTURE_COLS = ("treeID", "localID", "localDescID")
-VECTOR_SUFFIXES = {3: ("x", "y", "z")}
-
+STRUCTURE_COLS = ("treeID", "localID", "localDescID", "ID", "descID")
+RENAME = {"snapnum": "snapnumber", "aexp": "scalefactor"}  # ASTRAEUS name -> viewer name
+MAX_SCATTER_POINTS = 100_000
 
 GYR_PER_INV_H0 = 9.7779  # 1/H0 in Gyr for h = 1
-DEFAULT_COSMOLOGY = {"Omega_m": 0.315, "Omega_L": 0.685, "h": 0.674}
+DEFAULT_COSMOLOGY = {"Omega_m": 0.307115, "Omega_L": 0.692885, "h": 0.6777}  # VSMDPL (Planck 2013)
 
 
 def load_cosmology(config: str | Path | None) -> dict:
-    """Read the [cosmology] table of a simulation parameter file (TOML)."""
+    """Read the [cosmology] table of a parameter file (TOML); VSMDPL values without one."""
 
     if config and Path(config).is_file():
-        try:
-            import tomllib
-        except ModuleNotFoundError:  # Python < 3.11
-            import tomli as tomllib
+        import tomllib
         with open(config, "rb") as f:
             return {**DEFAULT_COSMOLOGY, **tomllib.load(f).get("cosmology", {})}
     return dict(DEFAULT_COSMOLOGY)
@@ -48,44 +41,31 @@ def cosmic_age_gyr(a: np.ndarray, cosmo: dict) -> np.ndarray:
     return 2.0 / (3.0 * np.sqrt(ol)) * GYR_PER_INV_H0 / h * np.arcsinh(np.sqrt(ol / om) * np.power(a, 1.5))
 
 
-def _read_json(path: Path) -> dict:
-    if orjson is not None:
-        return orjson.loads(path.read_bytes())
-    with path.open() as f:
-        return json.load(f)
+def _ratio(num, den) -> np.ndarray:
+    num, den = np.asarray(num, dtype=float), np.asarray(den, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(den > 0, num / den, np.nan)
 
 
-def flatten_galaxies(data: dict) -> pd.DataFrame:
-    """Turn ``{"trees": [{"treeID", "galaxies": [...]}]}`` into one flat table."""
+# name -> (columns it needs, formula); masses keep the file's h^-1 units, ratios are unit-free
+DERIVED = {
+    "sSFR": (("SFR", "Mstar"), lambda d: _ratio(d["SFR"], d["Mstar"])),
+    "Z_gas": (("MZ", "Mgas"), lambda d: _ratio(d["MZ"], d["Mgas"])),
+    "Z_O": (("MZ_O", "Mgas"), lambda d: _ratio(d["MZ_O"], d["Mgas"])),
+    "O_Fe": (("MZ_O", "MZ_Fe"), lambda d: _ratio(d["MZ_O"], d["MZ_Fe"])),
+    "f_gas": (("Mgas", "Mstar"), lambda d: _ratio(d["Mgas"], d["Mgas"] + d["Mstar"])),
+    "f_star": (("Mstar", "Mvir"), lambda d: _ratio(d["Mstar"], d["Mvir"])),
+    "f_baryon": (("Mgas", "Mstar", "Mvir"), lambda d: _ratio(d["Mgas"] + d["Mstar"], d["Mvir"])),
+    "dust_to_gas": (("Mdust", "Mgas"), lambda d: _ratio(d["Mdust"], d["Mgas"])),
+    "dust_to_metal": (("Mdust", "MZ"), lambda d: _ratio(d["Mdust"], d["MZ"])),
+    "f_ej": (("Mgas_ej", "Mgas_ini"), lambda d: _ratio(d["Mgas_ej"], d["Mgas_ini"])),
+}
 
-    rows = []
-    for t_index, tree in enumerate(data["trees"]):
-        tree_id = tree.get("treeID", t_index)
-        for galaxy in tree["galaxies"]:
-            if "treeID" not in galaxy:
-                galaxy = {**galaxy, "treeID": tree_id}
-            rows.append(galaxy)
 
-    df = pd.DataFrame(rows)
-    for col in list(df.columns):
-        sample = df[col].dropna()
-        if sample.empty:
-            continue
-        first = sample.iloc[0]
-        if isinstance(first, (list, tuple)):
-            arr = np.array(df[col].tolist(), dtype=float)
-            suffixes = VECTOR_SUFFIXES.get(arr.shape[1], range(arr.shape[1]))
-            for k, suffix in enumerate(suffixes):
-                df[f"{col}_{suffix}"] = arr[:, k]
-            df = df.drop(columns=col)
-        elif isinstance(first, dict):
-            df = df.drop(columns=col)
-
-    numeric = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) or pd.api.types.is_bool_dtype(df[c])]
-    df = df[numeric].astype(float, errors="ignore")
-    for col in STRUCTURE_COLS:
-        if col in df.columns:
-            df[col] = df[col].astype(np.int64)
+def add_derived(df: pd.DataFrame) -> pd.DataFrame:
+    for name, (needs, formula) in DERIVED.items():
+        if all(c in df for c in needs):
+            df[name] = formula(df)
     return df
 
 
@@ -187,61 +167,111 @@ class TreeData:
         self.y = y
 
 
-@dataclass
 class OutputFile:
-    path: Path
-    df: pd.DataFrame
-    mass_col: str
-    params: list[str] = field(default_factory=list)
-    time_cols: list[str] = field(default_factory=list)
-    steps: np.ndarray = field(default_factory=lambda: np.array([]))
-    _trees: dict = field(default_factory=dict)
-    _groups: dict = field(default_factory=dict)
+    """One ASTRAEUS treefile: read-only memory map + the index from ``build_index.py``."""
 
-    @classmethod
-    def load(cls, path: str | Path, cosmology: dict | None = None) -> "OutputFile":
-        path = Path(path)
-        df = flatten_galaxies(_read_json(path))
-        if "treeID" not in df:
-            df["treeID"] = 0
-        if "scalefactor" in df:
-            a = df["scalefactor"].to_numpy(dtype=float)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                df["redshift"] = np.where(a > 0, 1.0 / a - 1.0, np.nan)
-            cosmo = cosmology or DEFAULT_COSMOLOGY
-            df["cosmic_time"] = np.where(a > 0, cosmic_age_gyr(np.clip(a, 0, None), cosmo), np.nan)
-            df["lookback_time"] = float(cosmic_age_gyr(np.array(1.0), cosmo)) - df["cosmic_time"]
+    time_cols = ["snapnumber", "scalefactor", "redshift", "cosmic_time", "lookback_time"]
+    mass_col = "Mvir"
 
-        time_cols = [c for c in ("snapnumber", "scalefactor", "redshift", "cosmic_time", "lookback_time") if c in df]
-        if not time_cols:
-            raise ValueError("Output needs at least one of snapnumber / scalefactor")
-        key = "snapnumber" if "snapnumber" in df else "scalefactor"
-        steps = np.sort(df[key].unique())
-        df["_step"] = np.searchsorted(steps, df[key].to_numpy())
+    def __init__(self, path: Path, cosmology: dict):
+        self.path = path
+        self.cosmo = cosmology
+        self.ngal, self.mm = memmap_treefile(path)
+        self.offsets = np.concatenate([[0], np.cumsum(self.ngal)])
 
-        mass_col = "Mvir" if "Mvir" in df else next(
-            (c for c in df.columns if c not in STRUCTURE_COLS), df.columns[0])
-        params = [c for c in df.columns if c not in STRUCTURE_COLS and not c.startswith("_")]
-        groups = df.groupby("treeID", sort=True).indices
-        return cls(path, df, mass_col, params, time_cols, steps, {}, groups)
+        idx_file, stat = index_path(path), path.stat()
+        hint = f"run `python build_index.py {path}` first"
+        if not idx_file.is_file():
+            raise FileNotFoundError(f"no index file {idx_file.name}; {hint}")
+        with np.load(idx_file) as idx:
+            if (int(idx["version"]) != INDEX_VERSION or int(idx["src_size"]) != stat.st_size
+                    or int(idx["src_mtime_ns"]) != stat.st_mtime_ns):
+                raise ValueError(f"{idx_file.name} does not belong to this version of the file; {hint}")
+            self.snap = idx["snap"]
+            self.dmstar = idx["dMstar"]
+            self.tree_mass = idx["tree_mass"]
+            self.steps = idx["snap_ids"]
+            self.step_aexp = idx["snap_aexp"]
+            self._extent = {RENAME.get(str(c), str(c)): np.array([lo, pos, hi]) for c, lo, pos, hi in zip(
+                idx["col_names"], idx["col_min"], idx["col_minpos"], idx["col_max"])}
 
-    @property
-    def tree_ids(self) -> list[int]:
-        return [int(t) for t in self._groups]
+        self.step_age = cosmic_age_gyr(self.step_aexp, cosmology)  # Gyr
+        self.age_now = float(cosmic_age_gyr(np.array(1.0), cosmology))
+        # years since the previous snapshot (unknown for the first one)
+        self.step_dt = np.concatenate([[np.nan], np.diff(self.step_age)]) * 1e9
+        self._trees: dict[int, TreeData] = {}
+        self._samples: dict = {}
+        first = int(np.argmax(self.ngal > 0))
+        frame = self._frame(slice(int(self.offsets[first]), int(self.offsets[first]) + 1))
+        self.params = [c for c in frame.columns if c not in STRUCTURE_COLS and not c.startswith("_")]
+
+    # ---- reading ---------------------------------------------------------
+    def _frame(self, rows) -> pd.DataFrame:
+        """Galaxy table for a slice or a sorted array of global row numbers."""
+
+        df = pd.DataFrame(np.array(self.mm[rows]))
+        df = df.drop(columns=[c for c in ("Padding",) if c in df]).rename(columns=RENAME)
+        if isinstance(rows, slice):
+            rows = np.arange(rows.start, rows.stop)
+        # side="right" skips empty trees, which share their offset with the next tree
+        df["treeID"] = np.searchsorted(self.offsets, rows, side="right") - 1
+        step = np.searchsorted(self.steps, self.snap[rows])
+        df["_step"] = step
+        a = df["scalefactor"].to_numpy(dtype=float)
+        df["redshift"] = 1.0 / a - 1.0
+        df["cosmic_time"] = cosmic_age_gyr(a, self.cosmo)
+        df["lookback_time"] = self.age_now - df["cosmic_time"]
+        df["SFR"] = self.dmstar[rows] / self.step_dt[step]
+        return add_derived(df)
+
+    def has_tree(self, tree_id: int) -> bool:
+        return 0 <= tree_id < len(self.ngal) and self.ngal[tree_id] > 0
 
     def tree_summary(self) -> pd.DataFrame:
-        g = self.df.groupby("treeID")
-        out = pd.DataFrame({"n": g.size(), "mass": g[self.mass_col].max()})
-        return out.reset_index()
+        return pd.DataFrame({"treeID": np.arange(len(self.ngal)), "n": self.ngal, "mass": self.tree_mass})
 
     def tree(self, tree_id: int) -> TreeData:
         tree_id = int(tree_id)
         if tree_id not in self._trees:
             if len(self._trees) > 8:  # keep memory bounded
                 self._trees.pop(next(iter(self._trees)))
-            sub = self.df.iloc[self._groups[tree_id]]
-            self._trees[tree_id] = TreeData(sub, self.mass_col)
+            rows = slice(int(self.offsets[tree_id]), int(self.offsets[tree_id + 1]))
+            self._trees[tree_id] = TreeData(self._frame(rows), self.mass_col)
         return self._trees[tree_id]
+
+    def sample(self, step: int | None = None, n: int = MAX_SCATTER_POINTS) -> tuple[pd.DataFrame, int]:
+        """Up to ``n`` random galaxies of the whole file, or of one snapshot (index into ``steps``).
+
+        Returns the table and the number of galaxies it was drawn from.
+        """
+
+        key = (step, n)
+        if key not in self._samples:
+            if len(self._samples) >= 3:
+                self._samples.pop(next(iter(self._samples)))
+            rng = np.random.default_rng(0)
+            if step is None:
+                total = len(self.mm)
+                rows = rng.choice(total, n, replace=False) if total > n else np.arange(total)
+            else:
+                rows = np.flatnonzero(self.snap == self.steps[step])
+                total = len(rows)
+                if total > n:
+                    rows = rng.choice(rows, n, replace=False)
+            self._samples[key] = (self._frame(np.sort(rows)), total)
+        return self._samples[key]
+
+    def extent(self, col: str) -> np.ndarray:
+        """Values spanning the range of ``col`` over the whole file (exact for stored columns,
+        from the random sample for derived ones)."""
+
+        if col in self._extent:
+            return self._extent[col]
+        return self.sample()[0][col].to_numpy(dtype=float)
+
+    def step_label(self, idx: int) -> str:
+        a = self.step_aexp[idx]
+        return f"snapshot {self.steps[idx]} (z = {1 / a - 1:.3g}, t = {self.step_age[idx]:.3g} Gyr)"
 
 
 _COSMOLOGY: dict = dict(DEFAULT_COSMOLOGY)
@@ -258,7 +288,7 @@ def get_output(path: str | Path, cosmology: dict | None = None) -> OutputFile:
         return hit[1]
     if len(_CACHE) >= 2:
         _CACHE.pop(next(iter(_CACHE)))
-    out = OutputFile.load(path, cosmology or _COSMOLOGY)
+    out = OutputFile(path, cosmology or _COSMOLOGY)
     _CACHE[str(path)] = (mtime, out)
     return out
 
@@ -272,4 +302,4 @@ def set_cosmology(cosmology: dict) -> None:
 
 
 def list_outputs(directory: str | Path) -> list[Path]:
-    return sorted(Path(directory).glob("*.json"))
+    return sorted(Path(directory).glob("tree_*.dat"))

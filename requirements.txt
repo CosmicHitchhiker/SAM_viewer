@@ -2,5 +2,3 @@ dash>=2.14
 plotly>=5.18
 pandas>=2.0
 numpy>=1.24
-# optional, speeds up loading big JSON files
-orjson

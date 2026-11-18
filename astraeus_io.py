@@ -1,10 +1,11 @@
 #!/usr/bin/env python
 # coding: utf-8
 
+import os
+
 import numpy as np
 import pandas as pd
 from glob import glob
-from tqdm import tqdm
 
 
 #######################################
@@ -167,9 +168,9 @@ def read_snapshot(iout, path='./', outputsnapnumber=73, metals=True):
     return pd.DataFrame(gals[names])
 
 
-def read_treefile_raw(fname, metals=True, rockstarID=True):
+def tree_dtype(metals=True, rockstarID=False):
     """
-    Read a single treefile
+    Record layout of one galaxy in a treefile
     """
 
     if rockstarID:
@@ -220,7 +221,35 @@ def read_treefile_raw(fname, metals=True, rockstarID=True):
     if rockstarID:
         formats += ['f4']
 
-    dt = np.dtype({'names': names, 'formats': formats})
+    return np.dtype({'names': names, 'formats': formats})
+
+
+def memmap_treefile(fname):
+    """
+    Open a treefile READ-ONLY without loading it; the variant (metals / rockstarID)
+    is detected from the record size. Returns (ngal per tree, memory-mapped galaxies)
+    """
+
+    size = os.path.getsize(fname)
+    ngtree = int(np.fromfile(fname, dtype='i4', count=1)[0])
+    ngal = np.fromfile(fname, dtype='i4', count=ngtree, offset=4).astype(np.int64)
+    header = 4 + 4 * ngtree
+    total = int(ngal.sum())
+    for metals in (True, False):
+        for rockstarID in (False, True):
+            dt = tree_dtype(metals, rockstarID)
+            if total * dt.itemsize == size - header:
+                return ngal, np.memmap(fname, dtype=dt, mode='r', offset=header, shape=(total,))
+    raise ValueError(f'{fname}: record size {(size - header) / max(total, 1):.1f} bytes '
+                     'matches no known ASTRAEUS treefile layout')
+
+
+def read_treefile_raw(fname, metals=True, rockstarID=True):
+    """
+    Read a single treefile
+    """
+
+    dt = tree_dtype(metals, rockstarID)
 
     ngtree, = np.fromfile(fname, dtype='i', count=1)
     offset = np.dtype('i').itemsize
@@ -313,6 +342,8 @@ def read_halotree_raw(fname):
     # offset += dt.itemsize*nh
     ##data.append(pd.DataFrame(tree))
     # data.append(tree)
+
+    from tqdm import tqdm
 
     with open(fname, 'rb') as fnameID:
         for i in tqdm(range(numtrees)):

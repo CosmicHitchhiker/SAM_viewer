@@ -6,9 +6,8 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from data import OutputFile, TreeData
+from data import MAX_SCATTER_POINTS, OutputFile, TreeData
 
-MAX_SCATTER_POINTS = 100_000
 TIME_LABELS = {"snapnumber": "snapshot", "scalefactor": "scale factor a", "redshift": "redshift z",
                "cosmic_time": "cosmic time [Gyr]", "lookback_time": "lookback time [Gyr]"}
 REVERSED_TIME = ("redshift", "lookback_time")  # early times on the left/bottom
@@ -180,18 +179,16 @@ def relation_figure(out: OutputFile, tree: TreeData | None, sel: int | None, x: 
                     color: str | None, scope: str, log_x: bool, log_y: bool) -> go.Figure:
     if not x or not y:
         return _empty("Pick X and Y parameters")
+    note = ""
     if scope == "all":
-        df = out.df
+        df, total = out.sample()
+        if total > len(df):
+            note = f"showing a random {len(df):,} of {total:,} galaxies"
     elif scope == "tree":
         df = tree.df
     else:  # lineage
         members, _ = _lineage(tree, sel, "all")
         df = tree.df.iloc[members]
-
-    note = ""
-    if len(df) > MAX_SCATTER_POINTS:
-        note = f"showing a random {MAX_SCATTER_POINTS:,} of {len(df):,} points"
-        df = df.sample(MAX_SCATTER_POINTS, random_state=0)
 
     marker = dict(size=5 if len(df) < 5000 else 3, opacity=0.8)
     if color:
@@ -250,21 +247,24 @@ def snapshot_figure(out: OutputFile, tree: TreeData | None, step: int, x: str, y
 
     if not x or not y:
         return _empty("Pick X and Y parameters"), 0
-    pool = out.df if scope == "all" else tree.df
-    df = pool[pool["_step"] == step]
-    n_total = len(df)
+    if scope == "all":  # the caller reports the full count; the plot shows a random subset
+        df, n_total = out.sample(step)
+        extent = out.extent
+    else:
+        df = tree.df[tree.df["_step"] == step]
+        n_total = len(df)
+
+        def extent(col):
+            return tree.df[col].to_numpy(dtype=float)
     if n_total == 0:
         return _empty("No galaxies at this snapshot"), 0
-
-    if n_total > MAX_SCATTER_POINTS:  # the caller reports the full count; the plot shows a random subset
-        df = df.sample(MAX_SCATTER_POINTS, random_state=0)
 
     marker = dict(size=6 if len(df) < 3000 else 4, opacity=0.75)
     if color:
         marker.update(color=df[color], colorscale="Viridis", showscale=True,
                       colorbar=dict(title=color, thickness=12))
         if fix_axes:  # keep the colour scale fixed too while scrolling through time
-            vals = pool[color].to_numpy(dtype=float)
+            vals = extent(color)
             vals = vals[np.isfinite(vals)]
             if len(vals):
                 marker.update(cmin=float(vals.min()), cmax=float(vals.max()))
@@ -283,8 +283,8 @@ def snapshot_figure(out: OutputFile, tree: TreeData | None, step: int, x: str, y
     xaxis = dict(title=x, type="log" if log_x else "linear")
     yaxis = dict(title=y, type="log" if log_y else "linear")
     if fix_axes:
-        rx = _axis_range(pool[x].to_numpy(dtype=float), log_x)
-        ry = _axis_range(pool[y].to_numpy(dtype=float), log_y)
+        rx = _axis_range(extent(x), log_x)
+        ry = _axis_range(extent(y), log_y)
         if rx:
             xaxis["range"] = rx
         if ry:
