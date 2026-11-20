@@ -1,53 +1,95 @@
 # ASTRAEUS tree viewer
 
-A [Dash](https://dash.plotly.com) web app for exploring the galaxy merger trees
-(`tree_*.dat`) written by ASTRAEUS.
+An interactive web app for exploring the galaxy merger trees (`tree_*.dat` files)
+produced by the ASTRAEUS semi-analytic galaxy
+evolution model. It runs locally in your browser and is built with
+[Dash](https://dash.plotly.com) and Plotly.
+
+With it you can:
+
+* draw a merger tree as a graph and step through it in time,
+* inspect every stored parameter of any galaxy and walk to its progenitors and descendant,
+* plot the evolution of any parameter along a galaxy's history,
+* make scatter plots of any parameter against any other, for one tree or the whole file,
+* look at the full galaxy population of a single snapshot.
+
+Treefiles of several GB (millions of galaxies) are handled without loading them into
+memory, and the treefile itself is never modified.
+
+## Requirements
+
+* Python 3.9 or newer (3.11 or newer for the `--config` option, which uses `tomllib`)
+* `dash`, `plotly`, `pandas`, `numpy` (see `requirements.txt`)
+
+## Installation
 
 ```bash
+git clone <repository-url>
+cd viewer
+python -m venv .venv && source .venv/bin/activate   # optional
 pip install -r requirements.txt
-python build_index.py tree_0.dat        # once per treefile, see below
-python app.py --dir . --port 8050       # then open http://127.0.0.1:8050
 ```
 
-`--dir` is scanned for `tree_*.dat` files; use *Refresh file list* after adding one.
+## Usage
 
-## The treefile is never modified
+### 1. Build the index (once per treefile)
 
-A treefile is several GB (millions of galaxies), so it is **memory-mapped read-only**
-and never loaded as a whole: a tree is read when you select it, whole-file plots use
-a random sample of galaxies.
+```bash
+python build_index.py path/to/tree_0.dat [path/to/tree_1.dat ...]
+```
 
-Everything that would need a scan of the whole file is prepared once by
-`build_index.py`. It only *reads* the treefile and writes one new file next to it,
-`tree_0.dat.viewidx.npz` (~110 MB for 18 M galaxies, ~10–30 s), containing the
-snapshot number of every galaxy, the largest `Mvir` of every tree, the min/max of
-every column, the scale factor of every snapshot and `Mstar − Σ Mstar(progenitors)`
-of every galaxy. The app itself writes nothing. If the index is missing, or the
-treefile's size or modification time changed since it was built, the app says so and
-asks you to run the script.
+This reads the treefile once and writes a small sidecar file next to it,
+`tree_0.dat.viewidx.npz` (about 110 MB for 18 million galaxies; takes roughly
+10–30 s). It holds information that would otherwise require scanning the whole file
+on every start: the snapshot number of every galaxy, the largest `Mvir` of every tree,
+the min/max of every column, the scale factor of every snapshot and
+`Mstar − Σ Mstar(progenitors)` of every galaxy (used for the SFR).
 
-The layout variant (with/without metals, with/without rockstar IDs) is detected from
-the record size.
+The treefile is opened read-only. If the treefile changes later (different size or
+modification time), the viewer reports that the index is out of date; just run
+`build_index.py` again.
 
-## What it does
+### 2. Start the viewer
 
-| Tab | Features |
+```bash
+python app.py --dir path/to/treefiles
+```
+
+and open <http://127.0.0.1:8050> in a browser.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--dir DIR` | `.` | Directory scanned for `tree_*.dat` files. Files added later appear after clicking *Refresh file list*. |
+| `--port PORT` | `8050` | Port of the web server. |
+| `--host HOST` | `127.0.0.1` | Interface to listen on (use `0.0.0.0` to reach the viewer from another machine). |
+| `--config FILE.toml` | VSMDPL cosmology | Cosmology to use, see [Cosmology](#cosmology). |
+| `--debug` | off | Run Dash in debug mode (auto-reload, error pop-ups). |
+
+The treefile layout (with/without metals, with/without Rockstar IDs) is detected
+automatically from the record size.
+
+## Features
+
+| Tab | What it shows |
 | --- | --- |
-| **Merger tree** | Tree drawn as a graph (nodes = galaxies, edges = progenitor → descendant). Time on the x or y axis. Colour/size nodes by any parameter. **Time scroller**: slider + play button, either *growing tree* or *highlight snapshot*. Click a node to select it; its descendants and main progenitor branch are highlighted. |
-| **Galaxy** | All parameters of the selected galaxy, with buttons to jump to its direct progenitors / descendant. |
-| **Evolution** | Any number of parameters vs. time for the selected galaxy, its progenitors (or only the main branch) and its descendants. |
-| **Parameter vs parameter** | Scatter of any parameter against any other, optionally coloured by a third; for the selected lineage, the whole tree, or the whole file (random 100,000 galaxies). Clicking a point of another tree switches to that tree. |
-| **Snapshot population** | All galaxies of one snapshot (random 100,000 if there are more), for the whole file or the selected tree. Options: log axes, axes and colour scale fixed while scrolling through time, binned-median line. Clicking a point selects that galaxy, switching to its tree if needed. |
+| **Merger tree** | The tree as a graph (nodes = galaxies, edges = progenitor → descendant), with time on the x or y axis. Nodes can be coloured and sized by any parameter. A **time slider** with a play button either grows the tree snapshot by snapshot or highlights one snapshot. Clicking a node selects that galaxy and highlights its descendants and main progenitor branch. |
+| **Galaxy** | All parameters of the selected galaxy, with buttons to jump to its direct progenitors or its descendant. |
+| **Evolution** | Any number of parameters vs. time for the selected galaxy, its progenitors (all or only the main branch) and its descendants. |
+| **Parameter vs parameter** | Scatter plot of any parameter against any other, optionally coloured by a third, for the selected lineage, the whole tree, or the whole file (random sample of 100,000 galaxies). Clicking a point from another tree switches to that tree. |
+| **Snapshot population** | All galaxies of one snapshot (random sample of 100,000 if there are more), for the whole file or the selected tree. Options: log axes, axes and colour scale kept fixed while moving through time, binned-median line. Clicking a point selects that galaxy, switching trees if necessary. |
 
-**Choosing a tree:** a file can hold a million trees, so the dropdown lists only the
-500 with the most galaxies. Any other tree is reached with *Go to treeID* or by
-clicking a galaxy in a whole-file scatter plot.
+**Choosing a tree:** a file can contain a million trees, so the dropdown lists only
+the 500 trees with the most galaxies. Any other tree can be opened with *Go to treeID*
+or by clicking one of its galaxies in a whole-file scatter plot.
+
+**Large trees:** the *hide galaxies below log10 mass* slider thins out the tree
+drawing; by default only the 20,000 most massive galaxies are shown.
 
 ## Parameters
 
-All fields stored in the treefile are plottable, **with the values exactly as stored**
-(masses in h⁻¹ M☉ etc. — nothing is rescaled). `snapnum` and `aexp` are shown as
-`snapnumber` and `scalefactor`. Derived on the fly:
+Every field stored in the treefile can be plotted, **with values exactly as stored**
+(masses in h⁻¹ M☉ etc.; nothing is rescaled). `snapnum` and `aexp` are shown as
+`snapnumber` and `scalefactor`. The following quantities are derived on the fly:
 
 | Name | Definition |
 | --- | --- |
@@ -61,16 +103,35 @@ All fields stored in the treefile are plottable, **with the values exactly as st
 | `dust_to_gas`, `dust_to_metal` | Mdust / Mgas, Mdust / MZ |
 | `f_ej` | Mgas_ej / Mgas_ini |
 
-Ratios with a zero denominator are left empty. To add a quantity, add a line to
-`DERIVED` in `data.py`.
+Ratios with a zero denominator are left empty. "Keep axes fixed" uses the exact
+whole-file range for stored columns and the range of the random sample for derived
+ones.
 
-The cosmology defaults to VSMDPL (h = 0.6777, Ωm = 0.307115, ΩΛ = 0.692885); pass
-`--config file.toml` with a `[cosmology]` table (`Omega_m`, `Omega_L`, `h`) to change it.
+New derived quantities can be added with one line each in the `DERIVED` table in
+`data.py`.
 
-## Notes
+## Cosmology
 
-* **Large trees:** the *hide galaxies below log10 mass* slider thins the tree (it
-  defaults to the 20,000 most massive galaxies).
-* "Keep axes fixed" uses the exact whole-file range for stored columns and the range
-  of the random sample for derived ones.
-* `astraeus_io.py` holds the plain readers (`read_treefile`, ...) for use in notebooks.
+The default cosmology is VSMDPL (h = 0.6777, Ωm = 0.307115, ΩΛ = 0.692885). To use a
+different one, pass a TOML file with a `[cosmology]` table:
+
+```toml
+[cosmology]
+h = 0.6777
+Omega_m = 0.307115
+Omega_L = 0.692885
+```
+
+```bash
+python app.py --dir path/to/treefiles --config my_cosmology.toml
+```
+
+## Project layout
+
+| File | Contents |
+| --- | --- |
+| `app.py` | The Dash app (layout and callbacks); entry point. |
+| `build_index.py` | Builds the `.viewidx.npz` index for a treefile. |
+| `data.py` | Loading trees, derived quantities, cosmology. |
+| `figures.py` | Plotly figures. |
+| `astraeus_io.py` | Plain readers for ASTRAEUS output (`read_treefile`, `memmap_treefile`, `read_snapshot`, ...), usable on their own, e.g. in Jupyter notebooks. |
